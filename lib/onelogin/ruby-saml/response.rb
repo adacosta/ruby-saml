@@ -10,6 +10,8 @@ module OneLogin
       ASSERTION = "urn:oasis:names:tc:SAML:2.0:assertion"
       PROTOCOL  = "urn:oasis:names:tc:SAML:2.0:protocol"
       DSIG      = "http://www.w3.org/2000/09/xmldsig#"
+      ENCRYPTED_DATA_XMLNS = "http://www.w3.org/2001/04/xmlenc#"
+      AES_256_CBC = "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
 
       # TODO: This should probably be ctor initialized too... WDYT?
       attr_accessor :settings
@@ -133,11 +135,110 @@ module OneLogin
 
       private
 
+      def encrypted_assertions
+        nokogiri_xml_document.xpath('//saml:EncryptedAssertion', 'saml' => ASSERTION)
+      end
+
+      def nokogiri_xml_document
+        @nokogiri_xml_document ||= Nokogiri::XML(@response)
+      end
+
+      def has_encrypted_assertions?
+        encrypted_assertions.size > 0
+      end
+
+      def decrypt_assertion_aes_256_cbc(encrypted_assertion)
+        aes_256_cbc = OpenSSL::Cipher::AES.new(256, :CBC)
+        aes_256_cbc.decrypt
+        aes_256_cbc.key = decrypted_assertion_cipher_key(encrypted_assertion)
+        encrypted_assertion_value = encrypted_assertion_value(encrypted_assertion)
+
+        # Have to call 2x otherwise decryption doesn't happen; update mutates self
+        # Ruby OpenSSL bug? view source for http://www.ruby-doc.org/stdlib-1.9.3/libdoc/openssl/rdoc/OpenSSL/Cipher.html#method-i-update
+        aes_256_cbc.update(encrypted_assertion_value)
+        plain = aes_256_cbc.update(encrypted_assertion_value)
+        plain_chars = plain.chars.to_a
+        # The first 32B contain the last (of the decrypted string) 4B + 28B of junk, without the IV.
+        end_chars = plain_chars.shift(4)
+        junk_chars = plain_chars.shift(28)
+        plain_chars.push end_chars
+        plain_chars.join ''
+      end
+
+      def encrypted_assertion_symmetric_encryption_method(encrypted_assertion)
+        encrypted_assertion.xpath(
+          '//saml:EncryptedAssertion/xml_enc:EncryptedData/xml_enc:EncryptionMethod',
+          'saml' => ASSERTION,
+          'xml_enc' => ENCRYPTED_DATA_XMLNS
+        ).first
+      end
+
+      def encrypted_assertion_encrypted_cipher_key_value_base64(encrypted_assertion)
+        encrypted_assertion.xpath(
+          '//saml:EncryptedAssertion/xml_enc:EncryptedData/dsig:KeyInfo/xml_enc:EncryptedKey/xml_enc:CipherData/xml_enc:CipherValue',
+          'saml' => ASSERTION,
+          'xml_enc' => ENCRYPTED_DATA_XMLNS,
+          'dsig' => DSIG
+        ).first
+      end
+
+      def encrypted_assertion_value_base64(encrypted_assertion)
+        encrypted_assertion.xpath(
+          '//saml:EncryptedAssertion/xml_enc:EncryptedData/xml_enc:CipherData/xml_enc:CipherValue',
+          'saml' => ASSERTION,
+          'xml_enc' => ENCRYPTED_DATA_XMLNS,
+          'dsig' => DSIG
+        ).first
+      end
+
+      def encrypted_assertion_value(encrypted_assertion)
+        Base64.decode64(encrypted_assertion_value_base64(encrypted_assertion).text)
+      end
+
+      def encrypted_assertion_encrypted_cipher_key_value(encrypted_assertion)
+        Base64.decode64(encrypted_assertion_encrypted_cipher_key_value_base64(encrypted_assertion).text)
+      end
+
+      def decrypted_assertion_cipher_key(encrypted_assertion)
+        key = OpenSSL::PKey::RSA.new(settings.private_key)
+        key.private_decrypt(encrypted_assertion_encrypted_cipher_key_value(encrypted_assertion))
+      end
+
+      def decrypt_assertions_in_document
+        encrypted_assertions.each do |encrypted_assertion|
+          decrypt_assertion(encrypted_assertion)
+        end
+      end
+
+      def encryption_algorithm(encrypted_assertion)
+        encryption_method = encrypted_assertion_symmetric_encryption_method(encrypted_assertion)
+        encryption_method.attributes["Algorithm"].value
+      end
+
+      def decrypt_assertion(encrypted_assertion)
+        case encryption_algorithm(encrypted_assertion)
+        when AES_256_CBC
+          decrypted_assertion = decrypt_assertion_aes_256_cbc(encrypted_assertion)
+          replace_encrypted_assertion_with_decrypted_assertion(encrypted_assertion, decrypted_assertion)
+        else
+          raise("Only AES-256-CBC is implemented")
+        end
+      end
+
+      def replace_encrypted_assertion_with_decrypted_assertion(encrypted_assertion, decrypted_assertion)
+        parent = encrypted_assertion.parent
+        encrypted_assertion.remove
+        parent.add_child(decrypted_assertion)
+        # update document to look as if the EncryptedAssertion was always there as an Assertion
+        @document = XMLSecurity::SignedDocument.new(nokogiri_xml_document.root.to_xml, @errors)
+      end
+
       def validate(soft = true)
-        valid_saml?(document, soft)      &&
+        decrypt_assertions_in_document if has_encrypted_assertions?
+        valid_saml?(document, soft) &&
         validate_response_state(soft) &&
-        validate_conditions(soft)     &&
-        validate_issuer(soft)         &&
+        validate_conditions(soft) &&
+        validate_issuer(soft) &&
         document.validate_document(get_fingerprint, soft) &&
         validate_success_status(soft)
       end
