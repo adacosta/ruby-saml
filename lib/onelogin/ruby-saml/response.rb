@@ -200,6 +200,7 @@ module OneLogin
       end
 
       def decrypted_assertion_cipher_key(encrypted_assertion)
+        raise("settings.private_key must be set to decrypt assertion!") unless settings.private_key
         key = OpenSSL::PKey::RSA.new(settings.private_key)
         key.private_decrypt(encrypted_assertion_encrypted_cipher_key_value(encrypted_assertion))
       end
@@ -220,6 +221,7 @@ module OneLogin
         when AES_256_CBC
           decrypted_assertion = decrypt_assertion_aes_256_cbc(encrypted_assertion)
           replace_encrypted_assertion_with_decrypted_assertion(encrypted_assertion, decrypted_assertion)
+          # NOTE: detect and raise on decryption failure?
         else
           raise("Only AES-256-CBC is implemented")
         end
