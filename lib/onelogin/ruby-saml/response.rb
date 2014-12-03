@@ -150,19 +150,16 @@ module OneLogin
       def decrypt_assertion_aes_256_cbc(encrypted_assertion)
         aes_256_cbc = OpenSSL::Cipher::AES.new(256, :CBC)
         aes_256_cbc.decrypt
+        aes_256_cbc.padding = 0
         aes_256_cbc.key = decrypted_assertion_cipher_key(encrypted_assertion)
         encrypted_assertion_value = encrypted_assertion_value(encrypted_assertion)
-
-        # Have to call 2x otherwise decryption doesn't happen; update mutates self
-        # Ruby OpenSSL bug? view source for http://www.ruby-doc.org/stdlib-1.9.3/libdoc/openssl/rdoc/OpenSSL/Cipher.html#method-i-update
-        aes_256_cbc.update(encrypted_assertion_value)
-        plain = aes_256_cbc.update(encrypted_assertion_value)
-        plain_chars = plain.chars.to_a
-        # The first 32B contain the last (of the decrypted string) 4B + 28B of junk, without the IV.
-        end_chars = plain_chars.shift(4)
-        junk_chars = plain_chars.shift(28)
-        plain_chars.push end_chars
-        plain_chars.join ''
+        aes_256_cbc.iv = encrypted_assertion_value[0..15]
+        encrypted_data = encrypted_assertion_value[16..-1]
+        plain = aes_256_cbc.update(encrypted_data)
+        plain << aes_256_cbc.final
+        # Junk is left in the trunk after decryption
+        #   grab everything up until "Assertion>"
+        plain.match(/(.*<\/(saml:|)Assertion>)/m)[0]
       end
 
       def encrypted_assertion_symmetric_encryption_method(encrypted_assertion)
